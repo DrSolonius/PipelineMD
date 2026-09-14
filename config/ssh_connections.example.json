@@ -1,0 +1,15 @@
+[
+  {
+    "id": "example",
+    "name": "GPU cluster",
+    "host": "cluster.example.org",
+    "port": 22,
+    "username": "user",
+    "authType": "agent",
+    "keyPath": "",
+    "remoteWorkdir": "~/pipelineMD",
+    "scheduler": "slurm",
+    "setupCommand": "module load namd/3.0.3",
+    "status": "untested"
+  }
+]

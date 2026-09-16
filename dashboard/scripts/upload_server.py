@@ -14,7 +14,9 @@ import threading
 import time
 import uuid
 import tarfile
+from ssh_connections import SSHConnectionStore
 from projects import ProjectStore
+from project_state import refresh_simulation_state, successful_stages
 from execution_targets import resolve_target, prepare_remote, launch_command, stop_command, sync_outputs, ssh_command, ssh_env, PASSWORDS, CREDENTIALS, check_remote, remote_path
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,7 +34,9 @@ RUNS: dict[str, dict] = {}
 INGESTERS: dict[str, subprocess.Popen] = {}
 DATA_DIR = PROJECT / "dashboard" / "public" / "data"
 ACTIVE_DATA_POINTER = DATA_DIR / "active_dashboard.json"
-SSH_CONNECTIONS_FILE = PROJECT / "config" / "ssh_connections.json"
+SSH_CONNECTIONS_FILE = PROJECT / "config" / "ssh_connections.json"  # Legacy migration source.
+SSH_CONNECTIONS_DB = PROJECT / "config" / "ssh_connections.sqlite3"
+SSH_CONNECTIONS = SSHConnectionStore(SSH_CONNECTIONS_DB, SSH_CONNECTIONS_FILE)
 SSH_CONNECTIONS_LOCK = threading.Lock()
 RUN_START_LOCK = threading.Lock()
 NAMD_LAUNCH = (
@@ -77,6 +81,10 @@ def finish_run(job_id: str, process: subprocess.Popen, log_handle) -> None:
     job = RUNS[job_id]
     job["returncode"] = code
     job["status"] = "stopped" if job.get("stopRequested") else ("finished" if code == 0 else "error")
+    refresh_simulation_state(
+        Path(job["namdDir"]),
+        run_status=job["status"] if job["status"] in {"stopped", "error"} else None,
+    )
 
 
 def ensure_ingester(namd_dir: Path) -> None:
@@ -127,15 +135,17 @@ def restore_active_ingester() -> None:
         return
 
 
-def archive_previous_outputs(namd_dir: Path) -> Path | None:
+def archive_previous_outputs(namd_dir: Path, preserve_stages: set[str] | None = None) -> Path | None:
     runtime_patterns = (
         "step6*.out", "step6*.coor", "step6*.vel", "step6*.xsc", "step6*.dcd",
         "step6*.coor.old", "step6*.vel.old", "step6*.xsc.old",
         "step6*.coor.BAK", "step6*.vel.BAK", "step6*.xsc.BAK",
         "step6*.colvars.traj", "step6*.colvars.state",
     )
+    preserve_stages = preserve_stages or set()
     previous_files = list(dict.fromkeys(
         path for pattern in runtime_patterns for path in namd_dir.glob(pattern)
+        if not any(path.name.startswith(stage + ".") for stage in preserve_stages)
     ))
     if not previous_files:
         return None
@@ -148,6 +158,60 @@ def archive_previous_outputs(namd_dir: Path) -> Path | None:
     return history
 
 
+def build_resume_readme(namd_dir: Path, completed: list[str]) -> tuple[str, list[str]]:
+    """Create a fail-fast csh sequence containing only unfinished stages."""
+    inputs = sorted(
+        namd_dir.glob("step6*.inp"),
+        key=lambda path: tuple(int(value) for value in re.match(r"step(\d+)\.(\d+)", path.name).groups())
+        if re.match(r"step(\d+)\.(\d+)", path.name) else (999, 999),
+    )
+    if not inputs:
+        raise ValueError("La simulación no contiene etapas step6*.inp para ejecutar.")
+    completed_set = set(completed)
+    pending = [path.stem for path in inputs if path.stem not in completed_set]
+    lines = ["#!/bin/csh\n", "# Generado automáticamente para reanudar sin repetir etapas correctas.\n"]
+    for stage in completed:
+        lines.append(f'echo "SKIP {stage}: terminada correctamente"\n')
+    for stage in pending:
+        lines.extend([
+            f'echo "RUN {stage}"\n',
+            f"namd3 {stage}.inp > {stage}.out\n",
+            "if ( $status != 0 ) exit $status\n",
+        ])
+    (namd_dir / "README_reanudar").write_text("".join(lines), encoding="utf-8", newline="\n")
+    slurm_source = namd_dir / "submit_preparacion.slurm"
+    if slurm_source.is_file():
+        slurm = slurm_source.read_text(encoding="utf-8", errors="replace")
+        slurm = slurm.replace("README_preparacion", "README_reanudar")
+        (namd_dir / "submit_reanudar.slurm").write_text(slurm, encoding="utf-8", newline="\n")
+    return "README_reanudar", pending
+
+
+def align_namd_steps(namd_dir: Path) -> list[str]:
+    """Enforce NAMD's stepsPerCycle invariant immediately before execution."""
+    updated: list[str] = []
+    for path in sorted(namd_dir.glob("step*.inp")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        cycle_match = re.search(r"(?mi)^\s*stepspercycle\s+(\d+)", text)
+        cycle = int(cycle_match.group(1)) if cycle_match else 20
+        if cycle <= 0:
+            raise ValueError(f"stepsPerCycle inválido en {path.name}.")
+        changed = False
+
+        def align(match: re.Match[str]) -> str:
+            nonlocal changed
+            requested = int(match.group(2))
+            calibrated = ((requested + cycle - 1) // cycle) * cycle
+            changed = changed or calibrated != requested
+            return f"{match.group(1)}{calibrated}{match.group(3)}"
+
+        result = re.sub(r"(?mi)^(\s*(?:minimize|run)\s+)(\d+)([^\r\n]*)$", align, text)
+        if changed:
+            path.write_text(result, encoding="utf-8", newline="")
+            updated.append(f"{path.name} (múltiplos de {cycle})")
+    return updated
+
+
 def read_output_tail(path: Path, limit: int = 400) -> str:
     try:
         with path.open("rb") as handle:
@@ -157,6 +221,17 @@ def read_output_tail(path: Path, limit: int = 400) -> str:
             return handle.read().decode("utf-8", errors="replace")[-limit:]
     except OSError:
         return ""
+
+
+def slurm_job_id(job: dict) -> str | None:
+    if job["target"].get("scheduler") != "slurm":
+        return None
+    try:
+        log = Path(job["logFile"]).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"(?m)^SLURM_JOB_ID=(\d+)$", log)
+    return match.group(1) if match else None
 
 
 def remember_completed_tail(job: dict, path: Path) -> None:
@@ -220,19 +295,12 @@ def safe_name(value: str) -> str:
 
 def load_ssh_connections() -> list[dict]:
     with SSH_CONNECTIONS_LOCK:
-        try:
-            saved = json.loads(SSH_CONNECTIONS_FILE.read_text(encoding="utf-8"))
-            return saved if isinstance(saved, list) else []
-        except (OSError, json.JSONDecodeError):
-            return []
+        return SSH_CONNECTIONS.list()
 
 
 def save_ssh_connections(connections: list[dict]) -> None:
     with SSH_CONNECTIONS_LOCK:
-        SSH_CONNECTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temporary = SSH_CONNECTIONS_FILE.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(connections, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(SSH_CONNECTIONS_FILE)
+        SSH_CONNECTIONS.replace_all(connections)
 
 
 def validate_ssh_connection(raw: dict, existing: dict | None = None) -> dict:
@@ -413,6 +481,8 @@ class Handler(BaseHTTPRequestHandler):
             tail, active_output, steps_visible, completed_tails = output_progress(job)
             self._json(200, {
                 "jobId": job_id,
+                "pid": job["pid"],
+                "slurmJobId": slurm_job_id(job),
                 "target": {k: job["target"].get(k) for k in ("id", "name", "kind", "runDir")},
                 "syncError": job.get("syncError"),
                 "status": job["status"],
@@ -448,7 +518,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json(500, {"error": f"No se pudo abrir el selector de carpetas: {exc}"})
             return
-        if self.path in {"/projects", "/update-project", "/select-simulation"}:
+        if self.path in {"/projects", "/update-project", "/import-project", "/select-simulation"}:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 65536:
@@ -463,13 +533,18 @@ class Handler(BaseHTTPRequestHandler):
                 elif self.path == "/update-project":
                     project = PROJECT_STORE.update(str(request.get("projectId", "")), str(request.get("name", "")), str(request.get("description", "")))
                     self._json(200, {"project": project})
+                elif self.path == "/import-project":
+                    project = PROJECT_STORE.import_project(str(request.get("directory", "")))
+                    self._json(201, {"project": project})
                 else:
                     simulation = PROJECT_STORE.simulation(str(request.get("projectId", "")), str(request.get("simulationId", "")))
                     directory = Path(simulation["namdDir"]).resolve()
                     if not (directory / "README_preparacion").is_file():
                         raise ValueError("Los archivos de la simulación ya no están disponibles.")
                     ensure_ingester(directory)
-                    self._json(200, {"simulation": simulation})
+                    state = refresh_simulation_state(directory, active=True)
+                    simulation["state"] = state
+                    self._json(200, {"simulation": simulation, "state": state})
             except (OSError, ValueError) as exc:
                 self._json(400, {"error": str(exc)})
             return
@@ -586,23 +661,34 @@ class Handler(BaseHTTPRequestHandler):
                 if active:
                     self._json(409, {"error": "La preparación ya está en ejecución."})
                     return
+                calibrated_files = align_namd_steps(namd_dir)
+                completed_stages = successful_stages(namd_dir)
+                resume_readme, pending_stages = build_resume_readme(namd_dir, completed_stages)
+                state = refresh_simulation_state(namd_dir, active=True)
+                if not pending_stages:
+                    self._json(200, {
+                        "status": "already-completed", "state": state,
+                        "skippedStages": completed_stages,
+                    })
+                    return
                 target = resolve_target(str(request.get("targetId", "local")), load_ssh_connections())
                 job_id = uuid.uuid4().hex[:12]
                 if target["kind"] == "ssh":
-                    target["runDir"] = prepare_remote(target, namd_dir, job_id)
+                    target["runDir"] = prepare_remote(target, namd_dir, job_id, set(completed_stages))
                 else:
                     probe = subprocess.run(launch_command(target, namd_dir,
                         NAMD_LAUNCH.replace("exec csh README_preparacion", "command -v csh >/dev/null")),
                         cwd=namd_dir, capture_output=True, timeout=20)
                     if probe.returncode:
                         raise ValueError("El equipo local requiere NAMD y csh disponibles en WSL/Linux.")
-                history = archive_previous_outputs(namd_dir)
+                history = archive_previous_outputs(namd_dir, set(completed_stages))
+                refresh_simulation_state(namd_dir, run_status="running", active=True)
                 ensure_ingester(namd_dir)
                 log_file = namd_dir / "preparation_runner.log"
                 log_handle = log_file.open("w", encoding="utf-8")
                 try:
                     process = subprocess.Popen(
-                        launch_command(target, namd_dir, NAMD_LAUNCH), env=ssh_env(target),
+                        launch_command(target, namd_dir, NAMD_LAUNCH.replace("README_preparacion", resume_readme)), env=ssh_env(target),
                         stdin=subprocess.DEVNULL,
                         stdout=log_handle, stderr=subprocess.STDOUT, cwd=namd_dir,
                     )
@@ -611,7 +697,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise
                 RUNS[job_id] = {"projectId": request["projectId"], "simulationId": simulation["id"], "target": target, "status": "running", "namdDir": str(namd_dir), "logFile": str(log_file), "pid": process.pid, "process": process, "stopRequested": False, "historyDir": str(history) if history else None}
                 threading.Thread(target=finish_run, args=(job_id, process, log_handle), daemon=True).start()
-                self._json(202, {"jobId": job_id, "status": "running", "logFile": str(log_file), "targetName": target["name"], "remoteDir": target.get("runDir")})
+                self._json(202, {"jobId": job_id, "pid": process.pid, "status": "running", "logFile": str(log_file), "targetName": target["name"], "remoteDir": target.get("runDir"), "stepCountsAligned": calibrated_files, "skippedStages": completed_stages, "pendingStages": pending_stages})
             except (OSError, ValueError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
                 self._json(400, {"error": str(exc)})
             return
@@ -670,10 +756,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": str(exc)})
 
     def do_DELETE(self) -> None:
-        if not self.path.startswith("/ssh-connections/"):
+        path = self.path.split("?", 1)[0]
+        simulation_match = re.fullmatch(r"/projects/([^/]+)/simulations/([^/]+)", path)
+        if simulation_match:
+            project_id, simulation_id = map(unquote, simulation_match.groups())
+            try:
+                if any(job["projectId"] == project_id and job["simulationId"] == simulation_id
+                       and job["status"] in {"running", "stopping"} for job in RUNS.values()):
+                    raise ValueError("Detén la simulación antes de eliminarla.")
+                simulation = PROJECT_STORE.simulation(project_id, simulation_id)
+                PROJECT_STORE.delete_simulation(project_id, simulation_id)
+                try:
+                    pointer = json.loads(ACTIVE_DATA_POINTER.read_text(encoding="utf-8"))
+                    if pointer.get("namdDir") == simulation.get("namdDir"):
+                        ACTIVE_DATA_POINTER.unlink(missing_ok=True)
+                except (OSError, json.JSONDecodeError):
+                    pass
+                self._json(200, {"deleted": simulation_id})
+            except (OSError, ValueError) as exc:
+                self._json(400, {"error": str(exc)})
+            return
+        if not path.startswith("/ssh-connections/"):
             self._json(404, {"error": "Ruta inexistente"})
             return
-        connection_id = self.path.rsplit("/", 1)[-1]
+        connection_id = path.rsplit("/", 1)[-1]
         connections = load_ssh_connections()
         remaining = [item for item in connections if item["id"] != connection_id]
         if len(remaining) == len(connections):

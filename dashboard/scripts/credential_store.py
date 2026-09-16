@@ -1,30 +1,37 @@
-"""Per-user encrypted SSH passwords using Windows DPAPI."""
+"""Per-user encrypted SSH passwords using Windows DPAPI when available."""
 from __future__ import annotations
 import ctypes
+import sys
 from ctypes import wintypes
 from pathlib import Path
 
 class DATA_BLOB(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
 
-CRYPT32 = ctypes.WinDLL("crypt32", use_last_error=True)
-KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
-CRYPT32.CryptProtectData.argtypes = [ctypes.POINTER(DATA_BLOB), wintypes.LPCWSTR,
-    ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
-    ctypes.POINTER(DATA_BLOB)]
-CRYPT32.CryptProtectData.restype = wintypes.BOOL
-CRYPT32.CryptUnprotectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.c_void_p,
-    ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
-    ctypes.POINTER(DATA_BLOB)]
-CRYPT32.CryptUnprotectData.restype = wintypes.BOOL
-KERNEL32.LocalFree.argtypes = [ctypes.c_void_p]
-KERNEL32.LocalFree.restype = ctypes.c_void_p
+if sys.platform == "win32":
+    CRYPT32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    CRYPT32.CryptProtectData.argtypes = [ctypes.POINTER(DATA_BLOB), wintypes.LPCWSTR,
+        ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(DATA_BLOB)]
+    CRYPT32.CryptProtectData.restype = wintypes.BOOL
+    CRYPT32.CryptUnprotectData.argtypes = [ctypes.POINTER(DATA_BLOB), ctypes.c_void_p,
+        ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(DATA_BLOB)]
+    CRYPT32.CryptUnprotectData.restype = wintypes.BOOL
+    KERNEL32.LocalFree.argtypes = [ctypes.c_void_p]
+    KERNEL32.LocalFree.restype = ctypes.c_void_p
 
 def _blob(data: bytes):
     buffer = ctypes.create_string_buffer(data)
     return DATA_BLOB(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte))), buffer
 
 def _crypt(data: bytes, protect: bool) -> bytes:
+    if sys.platform != "win32":
+        raise RuntimeError(
+            "El almacenamiento de contraseñas con DPAPI solo está disponible en Windows. "
+            "En Linux usa autenticación SSH por agente o clave privada."
+        )
     source, keepalive = _blob(data)
     destination = DATA_BLOB()
     function = CRYPT32.CryptProtectData if protect else CRYPT32.CryptUnprotectData

@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import re
 import shutil
 import tarfile
@@ -13,14 +14,174 @@ from split_readme import split_readme
 MAX_MEMBERS = 100_000
 MAX_TOTAL_SIZE = 2 * 1024**3
 TEXT_SUFFIXES = {"", ".conf", ".inp", ".namd", ".sh", ".str", ".tcl", ".txt"}
-THERMALIZATION_STEPS = 2_000
-THERMALIZATION_RAMP_STEPS = 1_000
-EQUILIBRATION_STEPS = 1_000
-MINIMIZATION_STEPS = 1_000  # Duración reducida temporalmente para pruebas del pipeline.
+# Protocolo de preparación para ejecuciones reales. Las ventanas dinámicas usan
+# T(N) = clip(T₀ · (max(N, N₀) / N₀)^(2/3), T₀, Tmáx). A densidad constante,
+# L ∝ N^(1/3); el exponente 2/3 da una extensión conservadora de una ventana
+# de relajación difusiva (∝ L²), sin saltos discretos entre tamaños vecinos.
+REFERENCE_ATOM_COUNT = 100_000
+MAX_EQUILIBRATION_WINDOW_PS = 500.0
+BASE_THERMALIZATION_PS = 50.0
+MAX_THERMALIZATION_PS = 250.0
+BASE_MINIMIZATION_STEPS = 10_000
+MAX_MINIMIZATION_STEPS = 50_000
 PREPARATION_OUTPUT_ENERGIES = 100
 PREPARATION_COMPUTE_ENERGIES = 100
 STRUCTURAL_RESTART_FREQUENCY = 100
 PREPARATION_DCD_INTERVAL_PS = 0.5
+SLURM_PARTITION = "RunCuda"
+SLURM_NTASKS = 2
+SLURM_NAMD_MODULE = "namd/3.0.2"
+
+
+def _atom_count(namd_dir: Path) -> int | None:
+    """Return the CHARMM-GUI system size from the PSF, if present."""
+    psf = namd_dir / "step5_input.psf"
+    try:
+        with psf.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "!NATOM" in line:
+                    return int(line.split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _scaled_duration(base: float, maximum: float, atom_count: int | None) -> float:
+    """Scale a protocol time with the squared linear system dimension."""
+    atoms = max(atom_count or REFERENCE_ATOM_COUNT, REFERENCE_ATOM_COUNT)
+    scaled = base * (atoms / REFERENCE_ATOM_COUNT) ** (2.0 / 3.0)
+    return min(maximum, scaled)
+
+
+def _preparation_schedule(atom_count: int | None, steps_per_cycle: int = 20) -> dict[str, float | int]:
+    """Physical preparation windows derived from the system size.
+
+    The baseline is appropriate for a normal all-atom membrane/solvated system.
+    Dynamic times use the documented continuous size-scaling equation above.
+    The minimization estimator is quantized as S(N)=C·ceil(Sraw(N)/C), where
+    C is NAMD's stepsPerCycle, so every estimate is valid by construction.
+    """
+    equilibration_ps = _scaled_duration(100.0, MAX_EQUILIBRATION_WINDOW_PS, atom_count)
+    thermalization_ps = _scaled_duration(BASE_THERMALIZATION_PS, MAX_THERMALIZATION_PS, atom_count)
+    atoms = max(atom_count or REFERENCE_ATOM_COUNT, REFERENCE_ATOM_COUNT)
+    raw_minimization_steps = min(
+        MAX_MINIMIZATION_STEPS,
+        math.ceil(BASE_MINIMIZATION_STEPS * (atoms / REFERENCE_ATOM_COUNT) ** (1.0 / 3.0)),
+    )
+    if steps_per_cycle <= 0:
+        raise ValueError("stepsPerCycle debe ser positivo.")
+    minimization_steps = math.ceil(raw_minimization_steps / steps_per_cycle) * steps_per_cycle
+    return {
+        "atomCount": atom_count or 0,
+        "minimizationSteps": int(minimization_steps),
+        "thermalizationPs": thermalization_ps,
+        "equilibrationPs": equilibration_ps,
+    }
+
+
+def _steps_for_ps(text: str, duration_ps: float, stage_name: str) -> int:
+    match = re.search(r"(?mi)^\s*timestep\s+([0-9.eE+-]+)", text)
+    if match is None:
+        raise ValueError(f"No se encontró timestep en {stage_name}.")
+    timestep_fs = float(match.group(1))
+    if timestep_fs <= 0:
+        raise ValueError(f"El timestep de {stage_name} debe ser positivo.")
+    requested_steps = max(1, round(duration_ps * 1000.0 / timestep_fs))
+    return _multiple_of_steps_per_cycle(text, requested_steps, stage_name)
+
+
+def _multiple_of_steps_per_cycle(text: str, steps: int, stage_name: str) -> int:
+    """Round upward to NAMD's integration-cycle boundary."""
+    steps_per_cycle = _steps_per_cycle(text, stage_name)
+    return max(steps_per_cycle, math.ceil(steps / steps_per_cycle) * steps_per_cycle)
+
+
+def _steps_per_cycle(text: str, stage_name: str) -> int:
+    match = re.search(r"(?mi)^\s*stepspercycle\s+(\d+)", text)
+    steps_per_cycle = int(match.group(1)) if match else 20  # NAMD default
+    if steps_per_cycle <= 0:
+        raise ValueError(f"stepsPerCycle inválido en {stage_name}.")
+    return steps_per_cycle
+
+
+def _align_namd_step_counts(namd_dir: Path) -> list[str]:
+    """Make every numeric NAMD run/minimize directive cycle-compatible."""
+    updated: list[str] = []
+    for path in sorted(namd_dir.glob("step*.inp")):
+        text = path.read_text(encoding="utf-8-sig")
+        changed = False
+
+        def align(match: re.Match[str]) -> str:
+            nonlocal changed
+            steps = int(match.group(2))
+            aligned = _multiple_of_steps_per_cycle(text, steps, path.name)
+            changed = changed or aligned != steps
+            return f"{match.group(1)}{aligned}{match.group(3)}"
+
+        result = re.sub(r"(?mi)^(\s*(?:minimize|run)\s+)(\d+)([^\r\n]*)$", align, text)
+        if changed:
+            path.write_text(result, encoding="utf-8", newline="")
+            updated.append(path.name)
+    return updated
+
+
+def _schedule_comment(schedule: dict[str, float | int], duration_ps: float | None = None) -> str:
+    atoms = int(schedule["atomCount"])
+    atom_label = f"{atoms:,}" if atoms else "no disponible"
+    duration = f" · {duration_ps:g} ps" if duration_ps is not None else ""
+    return f"# Preparación ajustada para {atom_label} átomos{duration}.\n"
+
+
+def _slurm_submit_script(job_name: str, readme: str) -> str:
+    """Return a portable Slurm launcher for a csh CHARMM-GUI README."""
+    return f"""#!/usr/bin/env bash
+#SBATCH --job-name={job_name}
+#SBATCH --partition={SLURM_PARTITION}
+#SBATCH --ntasks={SLURM_NTASKS}
+#SBATCH --no-requeue
+#SBATCH --output=slurm-%x-%j.out
+#SBATCH --error=slurm-%x-%j.err
+
+set -euo pipefail
+module load {SLURM_NAMD_MODULE}
+
+# README_* invoca `namd3` directamente. Este wrapper conserva esos README sin
+# modificarlos y aplica los parámetros CUDA definidos para este clúster.
+namd_binary="$(command -v namd3)"
+if [[ -z "$namd_binary" ]]; then
+    echo "ERROR: namd3 no está disponible después de cargar {SLURM_NAMD_MODULE}." >&2
+    exit 127
+fi
+mkdir -p .slurm-bin
+cat > .slurm-bin/namd3 <<'EOF'
+#!/usr/bin/env bash
+exec "$MD_PIPELINE_NAMD_BINARY" +p 1 +devices 0 "$@"
+EOF
+chmod 700 .slurm-bin/namd3
+export MD_PIPELINE_NAMD_BINARY="$namd_binary"
+export PATH="$PWD/.slurm-bin:$PATH"
+
+exec csh {readme}
+"""
+
+
+def _write_slurm_submit_scripts(namd_dir: Path) -> list[str]:
+    """Create explicit sbatch entrypoints for preparation and production."""
+    preparation = namd_dir / "README_preparacion"
+    if not preparation.is_file():
+        raise ValueError("No existe README_preparacion para crear el script SLURM.")
+    # CHARMM-GUI's second split README contains the production sequence in this
+    # pipeline. Support a dedicated README_produccion if a future template adds it.
+    production = "README_produccion" if (namd_dir / "README_produccion").is_file() else "README_equilibracion"
+    if not (namd_dir / production).is_file():
+        raise ValueError("No existe README de equilibración/producción para crear el script SLURM.")
+    scripts = {
+        "submit_preparacion.slurm": _slurm_submit_script("md-preparacion", preparation.name),
+        "submit_produccion.slurm": _slurm_submit_script("md-produccion", production),
+    }
+    for name, content in scripts.items():
+        (namd_dir / name).write_text(content, encoding="utf-8", newline="\n")
+    return list(scripts)
 
 
 def _safe_extract(archive_path: Path, destination: Path) -> None:
@@ -304,7 +465,10 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
     execution = re.search(r"(?m)^\s*minimize\s+(\d+)\s*$", original)
     if execution is None:
         raise ValueError("step6.1_equilibration.inp no contiene una minimización.")
-    minimization_steps = MINIMIZATION_STEPS
+    schedule = _preparation_schedule(
+        _atom_count(namd_dir), _steps_per_cycle(original, "la minimización")
+    )
+    minimization_steps = int(schedule["minimizationSteps"])
     common = original[: execution.start()].rstrip() + "\n\n"
     provenance = (
         "# Derived from CHARMM-GUI step6.1_equilibration.inp.\n"
@@ -317,7 +481,7 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
         common,
         count=1,
     )
-    minimization = provenance + minimization
+    minimization = provenance + _schedule_comment(schedule) + minimization
     minimization += f"minimize                {minimization_steps}\n"
     minimization += "output                  step6.0_minimization\n"
 
@@ -357,10 +521,12 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
         "seed                    $random_seed\n"
         "print                   \"NAMD random seed: $random_seed (step6.1)\"\n"
     )
+    thermalization_steps = _steps_for_ps(thermalization, float(schedule["thermalizationPs"]), "la termalización")
+    thermalization_ramp_steps = max(2, min(thermalization_steps, round(thermalization_steps / 5)))
     thermalization += (
-        "# Rampa lineal de temperatura: 1 K -> $temp en 1000 pasos.\n"
+        f"# Rampa lineal de temperatura: 1 K -> $temp en {thermalization_ramp_steps} pasos.\n"
         "set ramp_start          1.0\n"
-        f"set ramp_steps          {THERMALIZATION_RAMP_STEPS}\n"
+        f"set ramp_steps          {thermalization_ramp_steps}\n"
         "set ramp_increment      [expr {($temp - $ramp_start) / ($ramp_steps - 1)}]\n"
         "reassignFreq            1\n"
         "reassignTemp            $ramp_start\n"
@@ -368,9 +534,9 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
         "reassignHold            $temp\n"
         "# NAMD no permite cambiar reassignFreq después de iniciar run.\n"
         "# Tras alcanzar $temp, reassignHold mantiene el objetivo hasta el final.\n"
-        f"run                     {THERMALIZATION_STEPS}\n"
+        f"run                     {thermalization_steps}\n"
     )
-    thermalization = provenance + thermalization
+    thermalization = provenance + _schedule_comment(schedule, float(schedule["thermalizationPs"])) + thermalization
 
     equilibration = _without_velocity_reassignment(common)
     equilibration = _set_energy_frequency(equilibration, "la primera equilibración")
@@ -386,10 +552,11 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
     equilibration = _add_restart_input(
         equilibration,
         "step6.1_thermalization",
-        minimization_steps + THERMALIZATION_STEPS,
+        minimization_steps + thermalization_steps,
     )
-    equilibration += f"run                     {EQUILIBRATION_STEPS}\n"
-    equilibration = provenance + equilibration
+    first_equilibration_steps = _steps_for_ps(equilibration, float(schedule["equilibrationPs"]), "la primera equilibración")
+    equilibration += f"run                     {first_equilibration_steps}\n"
+    equilibration = provenance + _schedule_comment(schedule, float(schedule["equilibrationPs"])) + equilibration
 
     _validate_charmm_gui_provenance(
         original,
@@ -413,9 +580,10 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
         if path == equilibration_path:
             continue
         text = path.read_text(encoding="utf-8-sig")
+        equilibration_steps = _steps_for_ps(text, float(schedule["equilibrationPs"]), path.name)
         text, replacements = re.subn(
             r"(?m)^(run\s+)\d+([^\r\n]*)$",
-            rf"\g<1>{EQUILIBRATION_STEPS}\g<2>",
+            rf"\g<1>{equilibration_steps}\g<2>",
             text,
         )
         if replacements < 1:
@@ -430,7 +598,7 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
         )
         if restart_frequency_updates != 1:
             raise ValueError(f"No se encontró restartfreq en {path.name}.")
-        path.write_text(text, encoding="utf-8", newline="")
+        path.write_text(_schedule_comment(schedule, float(schedule["equilibrationPs"])) + text, encoding="utf-8", newline="")
 
     # 6.0 y 6.1 quedan reservados para minimización y termalización.
     # Se renombran las equilibraciones en orden descendente para evitar colisiones.
@@ -466,17 +634,14 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
 
     # Cada proceso dinámico registra su propia semilla y admite reproducción
     # mediante NAMD_SEED_6_2, NAMD_SEED_6_3, etc.
+    elapsed_steps = minimization_steps + thermalization_steps
     for path in sorted(namd_dir.glob("step6.*_equilibration.inp")):
         match = re.fullmatch(r"step6\.(\d+)_equilibration\.inp", path.name)
         if match is None:
             continue
         stage_id = f"6.{match.group(1)}"
         text = path.read_text(encoding="utf-8-sig")
-        expected_first = (
-            minimization_steps
-            + THERMALIZATION_STEPS
-            + (int(match.group(1)) - 2) * EQUILIBRATION_STEPS
-        )
+        expected_first = elapsed_steps
         text, replacements = re.subn(
             r"(?m)^(firsttimestep\s+)\d+([^\r\n]*)$",
             rf"\g<1>{expected_first}\g<2>",
@@ -488,6 +653,10 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
         text = _enable_gpu_resident(text, stage_id)
         text = _add_stage_seed(text, stage_id)
         path.write_text(text, encoding="utf-8", newline="")
+        run_match = re.search(r"(?mi)^\s*run\s+(\d+)", text)
+        if run_match is None:
+            raise ValueError(f"No se encontró run en {path.name}.")
+        elapsed_steps += int(run_match.group(1))
 
     production = namd_dir / "step7_production.inp"
     production_text = production.read_text(encoding="utf-8-sig")
@@ -497,6 +666,7 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
         production_text,
     )
     production.write_text(production_text, encoding="utf-8", newline="")
+    cycle_aligned = _align_namd_step_counts(namd_dir)
 
     readme = namd_dir / "README"
     readme_text = readme.read_text(encoding="utf-8-sig")
@@ -528,7 +698,7 @@ def _separate_minimization_and_thermalization(namd_dir: Path) -> list[str]:
         minimization_path.name,
         thermalization_path.name,
         "step6.2_equilibration.inp",
-    ]
+    ] + cycle_aligned
 
 
 def build_namd_package(source: Path, output: Path) -> dict[str, object]:
@@ -554,6 +724,7 @@ def build_namd_package(source: Path, output: Path) -> dict[str, object]:
         renamed_in = _replace_namd_command(namd_dir)
         separated_stages = _separate_minimization_and_thermalization(namd_dir)
         readmes = _split_namd_readme(namd_dir)
+        slurm_scripts = _write_slurm_submit_scripts(namd_dir)
 
         shutil.copytree(namd_dir, output)
 
@@ -568,6 +739,7 @@ def build_namd_package(source: Path, output: Path) -> dict[str, object]:
         "namd_command_replaced_in": renamed_in,
         "stages_created_or_updated": separated_stages,
         "readmes_created": readmes,
+        "slurm_scripts_created": slurm_scripts,
         "simulations_executed": False,
     }
 

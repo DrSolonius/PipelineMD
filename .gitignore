@@ -13,7 +13,10 @@ uploads/
 simulations/
 prueba_pipeline*/
 config/projects.json
+config/projects.sqlite3
 config/ssh_connections.json
+config/ssh_connections.sqlite3
+config/ssh_master.key
 config/ssh_secrets/
 
 dashboard/.git/

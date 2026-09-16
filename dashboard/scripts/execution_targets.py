@@ -11,10 +11,13 @@ import subprocess
 import tarfile
 import tempfile
 import sys
-from credential_store import CredentialStore
+from encrypted_credentials import CredentialStore
 
 PASSWORDS: dict[str, str] = {}
-CREDENTIALS = CredentialStore(Path(__file__).parents[2] / "config" / "ssh_secrets")
+CREDENTIALS = CredentialStore(
+    Path(__file__).parents[2] / "config" / "ssh_connections.sqlite3",
+    Path(__file__).parents[2] / "config" / "ssh_master.key",
+)
 
 def ssh_env(connection: dict) -> dict | None:
     if connection.get("authType") != "password":
@@ -99,7 +102,7 @@ def check_remote(connection: dict) -> None:
         raise ValueError("No se pudo comprobar el entorno SSH: " + (details[-1000:] or str(check.returncode)))
 
 
-def prepare_remote(connection: dict, directory: Path, job_id: str) -> str:
+def prepare_remote(connection: dict, directory: Path, job_id: str, resume_stages: set[str] | None = None) -> str:
     remote = connection["remoteWorkdir"].rstrip("/") + "/runs/" + job_id
     prefix = remote_path(remote)
     # Unique job directory: existing remote results are never replaced.
@@ -115,7 +118,10 @@ def prepare_remote(connection: dict, directory: Path, job_id: str) -> str:
                 # also reach the remote machine.
                 runtime = path.suffix in {".out", ".dcd", ".coor", ".vel", ".xsc", ".xst"} or \
                     ".restart." in path.name or path.name.endswith((".BAK", ".old", ".sync"))
-                if path.is_file() and not runtime and path.name != "preparation_runner.log":
+                resume_artifact = bool(resume_stages) and any(
+                    path.name.startswith(stage + ".") for stage in resume_stages
+                ) and path.suffix in {".coor", ".vel", ".xsc"}
+                if path.is_file() and (not runtime or resume_artifact) and path.name != "preparation_runner.log":
                     tar.add(path, arcname=relative.as_posix(), recursive=False)
         archive.seek(0)
         result = subprocess.run(ssh_command(connection,
@@ -131,10 +137,10 @@ def launch_command(target: dict, directory: Path, script: str) -> list[str]:
         return local_command(directory, script)
     if target.get("scheduler") == "slurm":
         workdir = remote_path(target["runDir"])
-        workload = remote_environment(target) + "exec csh README_preparacion"
+        submit_script = "submit_reanudar.slurm" if "README_reanudar" in script else "submit_preparacion.slurm"
         script = (
-            f"cd {workdir} && job=$(sbatch --parsable --chdir={workdir} "
-            f"--output=slurm-%j.log --wrap={shlex.quote('bash -lc ' + shlex.quote(workload))}); "
+            f"cd {workdir} && test -f {submit_script} && "
+            f"job=$(sbatch --parsable --chdir={workdir} {submit_script}); "
             "job=${job%%;*}; case \"$job\" in ''|*[!0-9]*) echo 'ERROR: sbatch no devolvió un Job ID'; exit 1;; esac; "
             "echo \"$job\" > .pipeline.slurm_job; echo \"SLURM_JOB_ID=$job\"; "
             "while squeue -h -j \"$job\" | grep -q .; do sleep 5; done; "
@@ -142,8 +148,9 @@ def launch_command(target: dict, directory: Path, script: str) -> list[str]:
             "echo \"SLURM_STATE=$state\"; case \"$state\" in COMPLETED*) exit 0;; *) exit 1;; esac"
         )
     else:
+        readme = "README_reanudar" if "README_reanudar" in script else "README_preparacion"
         script = remote_environment(target) + f"cd {remote_path(target['runDir'])} && " + \
-            "setsid sh -c 'echo $$ > .pipeline.pid; exec csh README_preparacion' & wait $!"
+            f"setsid sh -c 'echo $$ > .pipeline.pid; exec csh {readme}' & wait $!"
     return ssh_command(target, "bash -lc " + shlex.quote(script))
 
 
@@ -161,15 +168,19 @@ def stop_command(target: dict, directory: Path, script: str) -> list[str]:
 
 
 def sync_outputs(target: dict, directory: Path) -> None:
-    """Copy text outputs atomically; trajectories remain in the remote workspace."""
+    """Copy outputs and the current coordinate snapshot atomically."""
     result = subprocess.run(ssh_command(target,
-        f"cd {remote_path(target['runDir'])} && tar -czf - -- step6*.out"),
+        f"cd {remote_path(target['runDir'])} && "
+        "tar --ignore-failed-read -czf - -- step6*.out step6*.coor step6*.vel step6*.xsc step6*.coor.old step6*.xsc.old"),
         capture_output=True, timeout=25, env=ssh_env(target), stdin=subprocess.DEVNULL)
     if not result.stdout:
         return
     with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:gz") as archive:
         for member in archive:
-            if not member.isfile() or not re.fullmatch(r"step6\.\d+_[A-Za-z0-9_]+\.out", member.name):
+            if not member.isfile() or not re.fullmatch(
+                r"step6\.\d+_[A-Za-z0-9_]+(?:\.restart)?\.(?:out|coor|vel|xsc|coor\.old|xsc\.old)",
+                member.name,
+            ):
                 continue
             source = archive.extractfile(member)
             if source is not None:

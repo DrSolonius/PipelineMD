@@ -1,0 +1,2 @@
+# This helper runs directly under Linux/WSL and needs Unix line endings.
+dashboard/scripts/ssh_askpass.py text eol=lf

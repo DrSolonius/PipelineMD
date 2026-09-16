@@ -16,8 +16,10 @@ import numpy as np
 
 try:
     from .equilibration_agent import ensure_continuation_stage, evaluate_equilibration
+    from .project_state import refresh_simulation_state
 except ImportError:
     from equilibration_agent import ensure_continuation_stage, evaluate_equilibration
+    from project_state import refresh_simulation_state
 
 
 ENERGY_FIELDS = {
@@ -33,6 +35,7 @@ DEFAULT_ENERGY_TITLE = [
     "MISC", "KINETIC", "TOTAL", "TEMP", "POTENTIAL", "TOTALAVG", "TEMPAVG",
     "PRESSURE", "GPRESSURE", "VOLUME", "PRESSAVG", "GPRESSAVG",
 ]
+STRUCTURAL_STATE_VERSION = 2  # RMSD/RMSF exclusivamente desde step6*.coor.old
 
 
 def _new_output_state() -> dict:
@@ -185,90 +188,10 @@ def read_namd_coor(path: Path, expected_atoms: int) -> np.ndarray:
     return np.frombuffer(raw, dtype="<f8", offset=4).reshape(atoms, 3).copy()
 
 
-def _read_dcd_record(handle, endian: str) -> bytes | None:
-    start = handle.tell()
-    marker = handle.read(4)
-    if len(marker) < 4:
-        return None
-    length = struct.unpack(endian + "i", marker)[0]
-    if length < 0 or length > 2_000_000_000:
-        raise ValueError("registro DCD inválido")
-    payload = handle.read(length)
-    closing = handle.read(4)
-    if len(payload) != length or len(closing) != 4:
-        handle.seek(start)
-        return None
-    if struct.unpack(endian + "i", closing)[0] != length:
-        raise ValueError("marcadores DCD inconsistentes")
-    return payload
-
-
-def iter_dcd_ca_frames(path: Path, ca_indices: np.ndarray, expected_atoms: int, start_frame: int = 0, start_offset: int | None = None):
-    """Lee frames completos de un DCD NAMD; ignora el frame parcial mientras se escribe."""
-    with path.open("rb") as handle:
-        marker = handle.read(4)
-        if len(marker) != 4:
-            return
-        little = struct.unpack("<i", marker)[0]
-        big = struct.unpack(">i", marker)[0]
-        endian = "<" if little == 84 else ">" if big == 84 else None
-        if endian is None:
-            raise ValueError("encabezado DCD no reconocido")
-        handle.seek(0)
-        header = _read_dcd_record(handle, endian)
-        if header is None or len(header) < 84 or header[:4] not in {b"CORD", b"VELD"}:
-            raise ValueError("encabezado DCD incompleto")
-        control = struct.unpack(endian + "20i", header[4:84])
-        first_step, stride, fixed_atoms = control[1], control[2], control[8]
-        if fixed_atoms:
-            raise ValueError("DCD con átomos fijos no soportado")
-        if _read_dcd_record(handle, endian) is None:
-            return
-        atom_record = _read_dcd_record(handle, endian)
-        if atom_record is None or len(atom_record) != 4:
-            return
-        atom_count = struct.unpack(endian + "i", atom_record)[0]
-        if atom_count != expected_atoms:
-            raise ValueError(f"DCD contiene {atom_count}/{expected_atoms} átomos")
-        dtype = np.dtype(endian + "f4")
-        data_start = handle.tell()
-        uses_cursor = start_offset is not None and data_start <= start_offset <= path.stat().st_size
-        if uses_cursor:
-            handle.seek(start_offset)
-        frame_index = start_frame if uses_cursor else 0
-        coordinate_bytes = atom_count * 4
-        while True:
-            frame_start = handle.tell()
-            x_record = _read_dcd_record(handle, endian)
-            if x_record is None:
-                break
-            if len(x_record) in {24, 48, 56}:
-                x_record = _read_dcd_record(handle, endian)
-                if x_record is None:
-                    handle.seek(frame_start)
-                    break
-            y_record = _read_dcd_record(handle, endian)
-            z_record = _read_dcd_record(handle, endian)
-            if x_record is None or y_record is None or z_record is None:
-                handle.seek(frame_start)
-                break
-            if not all(len(record) == coordinate_bytes for record in (x_record, y_record, z_record)):
-                raise ValueError("dimensiones DCD incompatibles")
-            if frame_index >= start_frame:
-                x = np.frombuffer(x_record, dtype=dtype)[ca_indices]
-                y = np.frombuffer(y_record, dtype=dtype)[ca_indices]
-                z = np.frombuffer(z_record, dtype=dtype)[ca_indices]
-                coordinates = np.column_stack((x, y, z)).astype(np.float64, copy=False)
-                yield frame_index, first_step + frame_index * stride, coordinates, handle.tell()
-            frame_index += 1
-
-
 def read_snapshot_step(coor: Path) -> int | None:
     """Lee el timestep exacto del XSC rotatorio asociado al COOR."""
     if coor.name.endswith(".coor.old"):
         xsc = coor.with_name(coor.name[:-len(".coor.old")] + ".xsc.old")
-    elif coor.name.endswith(".coor.BAK"):
-        xsc = coor.with_name(coor.name[:-len(".coor.BAK")] + ".xsc.BAK")
     else:
         return None
     try:
@@ -294,7 +217,8 @@ def load_structural_state(path: Path, n_ca: int) -> dict:
     if path.exists():
         try:
             saved = np.load(path, allow_pickle=False)
-            if saved["mean"].shape == (n_ca, 3):
+            version = int(saved["version"]) if "version" in saved.files else 0
+            if version == STRUCTURAL_STATE_VERSION and saved["mean"].shape == (n_ca, 3):
                 return {"count": int(saved["count"]), "mean": saved["mean"], "m2": saved["m2"], "seen": json.loads(str(saved["seen"])), "rmsd": json.loads(str(saved["rmsd"]))}
         except Exception:
             pass
@@ -302,7 +226,7 @@ def load_structural_state(path: Path, n_ca: int) -> dict:
 
 
 def save_structural_state(path: Path, state: dict) -> None:
-    np.savez_compressed(path, count=state["count"], mean=state["mean"], m2=state["m2"], seen=json.dumps(state["seen"]), rmsd=json.dumps(state["rmsd"]))
+    np.savez_compressed(path, version=STRUCTURAL_STATE_VERSION, count=state["count"], mean=state["mean"], m2=state["m2"], seen=json.dumps(state["seen"]), rmsd=json.dumps(state["rmsd"]))
 
 
 def update_structures(namd_dir: Path, state_path: Path) -> tuple[list[dict], list[dict]]:
@@ -312,43 +236,9 @@ def update_structures(namd_dir: Path, state_path: Path) -> tuple[list[dict], lis
     state = load_structural_state(state_path, len(ca_indices))
     changed = False
     point_indices = {(point.get("stage"), point.get("step")): index for index, point in enumerate(state["rmsd"])}
-    for dcd in sorted(namd_dir.glob("step6*.dcd")):
-        stage = dcd.stem
-        seen_key = str(dcd) + "#frames"
-        seen_dcd = state["seen"].get(seen_key, 0)
-        start_frame = int(seen_dcd.get("frames", 0)) if isinstance(seen_dcd, dict) else int(seen_dcd)
-        start_offset = (int(seen_dcd.get("offset", 0)) or None) if isinstance(seen_dcd, dict) else None
-        try:
-            if start_offset is not None and start_offset > dcd.stat().st_size:
-                start_frame, start_offset = 0, None
-        except OSError:
-            continue
-        processed_frames = start_frame
-        processed_offset = start_offset
-        try:
-            for frame_index, step, mobile_ca, frame_end in iter_dcd_ca_frames(dcd, ca_indices, len(reference), start_frame, start_offset):
-                processed_frames = frame_index + 1
-                processed_offset = frame_end
-                aligned = align_mobile(mobile_ca, ref_ca)
-                rmsd = float(np.sqrt(np.mean(np.sum((aligned - ref_ca) ** 2, axis=1))))
-                point = {"stage": stage, "step": step, "value": rmsd, "source": f"{dcd.name}#frame={frame_index + 1}", "capturedAt": datetime.now(timezone.utc).isoformat()}
-                duplicate = point_indices.get((stage, step))
-                if duplicate is not None:
-                    state["rmsd"][duplicate] = point
-                else:
-                    delta = aligned - state["mean"]
-                    state["count"] += 1
-                    state["mean"] += delta / state["count"]
-                    state["m2"] += delta * (aligned - state["mean"])
-                    state["rmsd"].append(point)
-                    point_indices[(stage, step)] = len(state["rmsd"]) - 1
-                changed = True
-        except (OSError, ValueError, np.linalg.LinAlgError):
-            continue
-        if processed_frames != start_frame:
-            state["seen"][seen_key] = {"frames": processed_frames, "offset": processed_offset}
-            changed = True
-    candidates = sorted(set(namd_dir.glob("step6*.coor.old")) | set(namd_dir.glob("step6*.coor.BAK")))
+    # Una muestra por cada rotación de restart. Los DCD pueden ser enormes y no
+    # se leen para las gráficas; .xsc.old entrega el timestep de .coor.old.
+    candidates = sorted(namd_dir.glob("step6*.coor.old"))
     for coor in candidates:
         try:
             snapshot_stat = coor.stat()
@@ -445,8 +335,8 @@ def build_payload(namd_dir: Path, output: Path, output_cache: IncrementalOutputC
         },
         "errors": errors,
         "previousRun": {"stages": previous_stages},
-        "rmsd": {"status": "ready" if rmsd_series else "pending", "reason": structural_error or "Esperando el primer frame .dcd o cambio de .coor.old.", "series": rmsd_series},
-        "rmsf": {"status": "ready" if rmsf_series else "pending", "reason": structural_error or "Se necesitan al menos dos snapshots alineados.", "series": rmsf_series},
+        "rmsd": {"status": "ready" if rmsd_series else "pending", "reason": structural_error or "Esperando la primera rotación de step6*.coor.old.", "series": rmsd_series},
+        "rmsf": {"status": "ready" if rmsf_series else "pending", "reason": structural_error or "Se necesitan al menos dos archivos .coor.old alineados.", "series": rmsf_series},
         "agent": agent_result,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -458,6 +348,7 @@ def build_payload(namd_dir: Path, output: Path, output_cache: IncrementalOutputC
     decision_temporary.write_text(json.dumps(agent_result, ensure_ascii=False, indent=2), encoding="utf-8")
     decision_temporary.replace(decision_path)
     seed_registry_path.write_text(json.dumps({"namdDir": str(namd_dir), "stages": seed_registry}, ensure_ascii=False, indent=2), encoding="utf-8")
+    refresh_simulation_state(namd_dir, stages)
     print(f"{output}: {len(stages)} salidas, {len(all_rows)} puntos, {len(rmsd_series)} RMSD, {len(errors)} errores", flush=True)
 
 

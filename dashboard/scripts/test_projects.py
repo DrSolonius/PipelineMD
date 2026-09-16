@@ -9,6 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from projects import ProjectStore
+from project_state import read_config, refresh_simulation_state
 import upload_server as api
 
 
@@ -37,15 +38,99 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.allocate("../../escape", "file.tgz", "Sistema")
 
+    def test_config_ini_tracks_project_and_simulation_steps(self):
+        project = self.store.create("Estado portable", "Línea uno\nLínea dos", str(self.root))
+        simulation = self.store.allocate(project["id"], "system.tgz", "Sistema")
+        namd_dir = Path(simulation["namdDir"])
+        namd_dir.mkdir(parents=True)
+        for stage in ("step6.0_minimization", "step6.1_thermalization", "step6.2_equilibration"):
+            (namd_dir / f"{stage}.inp").write_text("run 20\n")
+        self.store.register(project["id"], simulation)
+        state = refresh_simulation_state(namd_dir, [
+            {"stage": "step6.0_minimization", "status": "done"},
+            {"stage": "step6.1_thermalization", "status": "running"},
+        ], active=True)
+        self.assertEqual(state["currentStep"], "step6.1_thermalization")
+        self.assertEqual(state["completedSteps"], ["step6.0_minimization"])
+        self.assertEqual(state["pendingSteps"], ["step6.2_equilibration"])
+        config = read_config(Path(project["directory"]) / "config.ini")
+        self.assertEqual(config["project"]["id"], project["id"])
+        self.assertEqual(config["dashboard"]["active_simulation_id"], simulation["id"])
+        loaded = ProjectStore(self.root).simulation(project["id"], simulation["id"])
+        self.assertEqual(loaded["state"]["progressPercent"], 33)
+
+    def test_state_can_be_rebuilt_from_namd_outputs(self):
+        project = self.store.create("Reinicio", "", str(self.root))
+        simulation = self.store.allocate(project["id"], "system.tgz", "Sistema")
+        namd_dir = Path(simulation["namdDir"])
+        namd_dir.mkdir(parents=True)
+        (namd_dir / "step6.0_minimization.inp").write_text("run 20\n")
+        (namd_dir / "step6.1_thermalization.inp").write_text("run 20\n")
+        (namd_dir / "step6.0_minimization.out").write_text("Info: End of program\n")
+        (namd_dir / "step6.1_thermalization.out").write_text("ENERGY: 20\n")
+        self.store.register(project["id"], simulation)
+        state = refresh_simulation_state(namd_dir)
+        self.assertEqual(state["completedSteps"], ["step6.0_minimization"])
+        self.assertEqual(state["currentStep"], "step6.1_thermalization")
+        self.assertEqual(state["status"], "running")
+
+    def test_resume_readme_skips_only_successful_stages(self):
+        namd_dir = self.root / "namd"
+        namd_dir.mkdir()
+        for stage in ("step6.0_minimization", "step6.1_thermalization", "step6.2_equilibration"):
+            (namd_dir / f"{stage}.inp").write_text("run 20\n")
+        name, pending = api.build_resume_readme(namd_dir, ["step6.0_minimization"])
+        script = (namd_dir / name).read_text()
+        self.assertIn("SKIP step6.0_minimization", script)
+        self.assertNotIn("namd3 step6.0_minimization.inp", script)
+        self.assertIn("namd3 step6.1_thermalization.inp", script)
+        self.assertEqual(pending, ["step6.1_thermalization", "step6.2_equilibration"])
+        empty = self.root / "empty"
+        empty.mkdir()
+        with self.assertRaisesRegex(ValueError, "step6"):
+            api.build_resume_readme(empty, [])
+
+    def test_archiving_preserves_successful_stage_artifacts(self):
+        namd_dir = self.root / "archive-namd"
+        namd_dir.mkdir()
+        kept = namd_dir / "step6.0_minimization.out"
+        retried = namd_dir / "step6.1_thermalization.out"
+        kept.write_text("Info: End of program\n")
+        retried.write_text("partial\n")
+        history = api.archive_previous_outputs(namd_dir, {"step6.0_minimization"})
+        self.assertTrue(kept.is_file())
+        self.assertFalse(retried.exists())
+        self.assertTrue((history / retried.name).is_file())
+
+    def test_project_can_be_imported_from_portable_config(self):
+        project = self.store.create("Portable", "Objetivo", str(self.root))
+        simulation = self.store.allocate(project["id"], "system.tgz", "Sistema")
+        Path(simulation["namdDir"]).mkdir(parents=True)
+        self.store.register(project["id"], simulation)
+        other_root = self.root / "other-catalog"
+        imported = ProjectStore(other_root).import_project(project["directory"])
+        self.assertEqual(imported["id"], project["id"])
+        self.assertEqual(imported["description"], "Objetivo")
+        self.assertEqual(imported["simulations"][0]["namdDir"], simulation["namdDir"])
+
     def test_legacy_discovery_without_moving_files(self):
         directory = self.root / "simulations" / "old" / "replica_01" / "namd"
         directory.mkdir(parents=True)
         (directory / "README_preparacion").write_text("original")
         legacy = self.store.get("legacy")
         self.assertEqual(legacy["simulations"][0]["namdDir"], str(directory.resolve()))
+        self.assertEqual(legacy["simulations"][0]["state"]["currentStep"], None)
         self.store.create("Nuevo", "", str(self.root))
         self.assertEqual(len(self.store.get("legacy")["simulations"]), 1)
         self.assertEqual((directory / "README_preparacion").read_text(), "original")
+
+    def test_old_managed_project_is_migrated_to_config_ini(self):
+        project = self.store.create("Anterior", "", str(self.root))
+        config_path = Path(project["directory"]) / "config.ini"
+        config_path.unlink()
+        loaded = ProjectStore(self.root).get(project["id"])
+        self.assertEqual(loaded["id"], project["id"])
+        self.assertTrue(config_path.is_file())
 
     def test_http_create_upload_select_and_membership(self):
         def prepare(command, **kwargs):

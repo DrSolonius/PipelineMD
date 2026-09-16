@@ -17,8 +17,13 @@ elegida se crea `<nombre>-<id>/project.json` y `simulations/`. Cada simulación
 conserva el archivo original en `charmm-gui/`, usa `work/replica_01/namd/` para
 los archivos preparados y crea `results/` para sus resultados y análisis.
 
-El catálogo se guarda en `config/projects.json`. Las nuevas carpetas siguen
+El catálogo se guarda en `config/projects.sqlite3` (y migra automáticamente el
+antiguo `config/projects.json`). Las nuevas carpetas siguen
 `simulations/projects/<proyecto-id>/<simulacion-id>/replica_01/namd`.
+Las conexiones SSH se guardan en `config/ssh_connections.sqlite3`; si se usa
+autenticación por contraseña, esta se cifra antes de guardarse. La clave local
+necesaria para descifrarla queda separada en `config/ssh_master.key` y no se
+incluye en Git.
 Las carpetas del formato anterior aparecen en «Simulaciones anteriores» sin
 moverse. La selección de proyecto/simulación queda bloqueada durante una carga
 o ejecución iniciada desde ese panel.
@@ -42,7 +47,12 @@ con Local seleccionado.
 - SSH directo: agrega y prueba la conexión en SSH. Requiere namd3, csh, tar y
   setsid disponibles en el PATH de la sesión SSH no interactiva. Usa las claves
   conocidas por OpenSSH y autenticación no interactiva por agente o archivo.
-- Slurm/PBS: aparecen como no disponibles; aún no se envían trabajos a colas.
+- SLURM: al ejecutar «RUN preparación», se envía `submit_preparacion.slurm` con
+  `sbatch`. El paquete preparado también contiene `submit_produccion.slurm` para
+  enviar después la secuencia de equilibración/producción. Ambos scripts usan la
+  partición `RunCuda`, 2 tareas, `module load namd/3.0.2`, `+p 1 +devices 0` y no
+  establecen `#SBATCH --time`, por lo que aplican el límite de la partición.
+- PBS: aún no está soportado.
 
 Cada ejecución SSH crea `<directorio remoto>/runs/<id>` y transfiere los archivos
 de entrada. La API comprueba el entorno remoto antes de archivar las salidas

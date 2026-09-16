@@ -40,6 +40,8 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn("sacct", launch)
         self.assertIn(".pipeline.slurm_job", launch)
         self.assertIn("scancel", stop_command(target, Path("."), "")[-1])
+        resume = launch_command(target, Path("."), "exec csh README_reanudar")[-1]
+        self.assertIn("submit_reanudar.slurm", resume)
 
     def test_preflight_reports_missing_tool(self):
         with patch("execution_targets.subprocess.run", return_value=subprocess.CompletedProcess([], 1, b"OK: csh\nFALTA: namd3\n", b"")):
@@ -54,7 +56,9 @@ class ExecutionTests(unittest.TestCase):
     def test_sync_only_accepts_regular_stage_outputs(self):
         stream = io.BytesIO()
         with tarfile.open(fileobj=stream, mode="w:gz") as archive:
-            for name in ["step6.0_minimization.out", "../escape", "README_preparacion"]:
+            for name in ["step6.0_minimization.out", "step6.0_minimization.coor.old",
+                         "step6.0_minimization.xsc.old", "step6.0_minimization.dcd",
+                         "../escape", "README_preparacion"]:
                 data = b"ENERGY: 0 300\n"
                 member = tarfile.TarInfo(name)
                 member.size = len(data)
@@ -64,7 +68,10 @@ class ExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             with patch("execution_targets.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stream.getvalue(), b"")):
                 sync_outputs(target, Path(temporary))
-            self.assertEqual([p.name for p in Path(temporary).iterdir()], ["step6.0_minimization.out"])
+            self.assertEqual(sorted(p.name for p in Path(temporary).iterdir()), [
+                "step6.0_minimization.coor.old", "step6.0_minimization.out",
+                "step6.0_minimization.xsc.old",
+            ])
 
 
 if __name__ == "__main__":

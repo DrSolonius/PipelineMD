@@ -237,10 +237,30 @@ const emptySshForm: SshForm = {
   username: '',
   authType: 'agent',
   keyPath: '',
-  setupCommand: 'module load namd/3.0.3',
+  setupCommand: 'module load namd/3.0.2',
   remoteWorkdir: '~/md-pipeline',
   scheduler: 'none',
 };
+
+const SSH_PASSWORD_SESSION_KEY = 'md-pipeline:ssh-passwords';
+const EXECUTION_TARGET_STORAGE_KEY = 'md-pipeline:execution-target';
+
+function readSessionPasswords(): Record<string, string> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const value: unknown = JSON.parse(
+      window.sessionStorage.getItem(SSH_PASSWORD_SESSION_KEY) ?? '{}',
+    );
+    if (!value || typeof value !== 'object') return {};
+    return Object.fromEntries(
+      Object.entries(value).filter(
+        ([, password]) => typeof password === 'string' && password.length > 0,
+      ),
+    );
+  } catch {
+    return {};
+  }
+}
 
 function SshModule() {
   const [connections, setConnections] = useState<SshConnection[]>([]);
@@ -248,7 +268,15 @@ function SshModule() {
   const [showForm, setShowForm] = useState(false);
   const [busy, setBusy] = useState('');
   const [message, setMessage] = useState('');
-  const [passwords, setPasswords] = useState<Record<string, string>>({});
+  const [passwords, setPasswords] = useState<Record<string, string>>(
+    readSessionPasswords,
+  );
+  useEffect(() => {
+    window.sessionStorage.setItem(
+      SSH_PASSWORD_SESSION_KEY,
+      JSON.stringify(passwords),
+    );
+  }, [passwords]);
   async function loadConnections() {
     try {
       const response = await fetch(`${API_BASE}/ssh-connections`, {
@@ -331,7 +359,6 @@ function SshModule() {
         setConnections((items) =>
           items.map((item) => (item.id === id ? body.connection! : item)),
         );
-      setPasswords((values) => ({ ...values, [id]: '' }));
       setMessage(
         body.connection?.lastMessage || body.error || 'Prueba terminada.',
       );
@@ -354,6 +381,10 @@ function SshModule() {
       };
       if (!response.ok) throw new Error(body.error);
       setConnections((items) => items.filter((item) => item.id !== id));
+      setPasswords((values) => {
+        const { [id]: _removed, ...remaining } = values;
+        return remaining;
+      });
       setMessage('Conexión eliminada.');
     } catch (error) {
       setMessage(
@@ -499,7 +530,7 @@ function SshModule() {
                 onChange={(e) =>
                   setForm({ ...form, setupCommand: e.target.value })
                 }
-                placeholder="Ej.: module load namd/3.0.3"
+                placeholder="Ej.: module load namd/3.0.2"
               />
               <small>
                 Se guarda únicamente para este host y se ejecuta antes de
@@ -521,7 +552,8 @@ function SshModule() {
           <div className="ssh-form-actions">
             <span>
               <KeyRound />
-              No se guardan contraseñas ni el contenido de las claves.
+              La contraseña se conserva solo durante esta pestaña; no se guarda
+              en SQLite y solo se usa para autenticar esta conexión SSH.
             </span>
             <button className="run-button" disabled={busy === 'save'}>
               {busy === 'save' ? <LoaderCircle className="spin" /> : <Save />}
@@ -689,6 +721,15 @@ type Simulation = {
   namdDir: string;
   filename: string | null;
   createdAt: string | null;
+  state?: {
+    status: 'pending' | 'running' | 'completed' | 'finished' | 'stopped' | 'error';
+    currentStep: string | null;
+    completedSteps: string[];
+    pendingSteps: string[];
+    failedSteps: string[];
+    progressPercent: number;
+    updatedAt: string | null;
+  } | null;
 };
 type SimulationProject = {
   id: string;
@@ -829,6 +870,12 @@ export default function Home() {
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const runPollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const savedTarget = window.localStorage.getItem(
+      EXECUTION_TARGET_STORAGE_KEY,
+    );
+    if (savedTarget) setTargetId(savedTarget);
+  }, []);
   const logClock = () =>
     new Date().toLocaleTimeString('es-CL', { hour12: false });
   async function chooseSimulation(
@@ -856,9 +903,29 @@ export default function Home() {
             simulationId: nextSimulationId,
           }),
         });
-        const body = (await response.json()) as { error?: string };
+        const body = (await response.json()) as {
+          simulation?: Simulation;
+          state?: Simulation['state'];
+          error?: string;
+        };
         if (!response.ok)
           throw new Error(body.error || 'No se pudo abrir la simulación.');
+        if (body.state) {
+          setProjects((items) =>
+            items.map((project) =>
+              project.id !== nextProjectId
+                ? project
+                : {
+                    ...project,
+                    simulations: project.simulations.map((simulation) =>
+                      simulation.id === nextSimulationId
+                        ? { ...simulation, state: body.state }
+                        : simulation,
+                    ),
+                  },
+            ),
+          );
+        }
         setSimulationId(nextSimulationId);
       }
     } catch (error) {
@@ -1107,6 +1174,73 @@ export default function Home() {
       if (fileInput.current) fileInput.current.value = '';
     }
   }
+  async function importProject() {
+    setProjectBusy(true);
+    setProjectError('');
+    try {
+      const directoryResponse = await fetch(
+        `${API_BASE}/choose-project-directory`,
+        { method: 'POST' },
+      );
+      const directoryBody = (await directoryResponse.json()) as {
+        directory?: string | null;
+        cancelled?: boolean;
+        error?: string;
+      };
+      if (!directoryResponse.ok)
+        throw new Error(directoryBody.error || 'No se pudo seleccionar la carpeta.');
+      if (directoryBody.cancelled || !directoryBody.directory) return;
+      const response = await fetch(`${API_BASE}/import-project`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ directory: directoryBody.directory }),
+      });
+      const body = (await response.json()) as {
+        project?: SimulationProject;
+        error?: string;
+      };
+      if (!response.ok || !body.project)
+        throw new Error(body.error || 'No se pudo cargar el proyecto.');
+      await loadProjects(body.project.id, body.project.simulations[0]?.id);
+    } catch (error) {
+      setProjectError(
+        error instanceof Error ? error.message : 'No se pudo cargar el proyecto.',
+      );
+    } finally {
+      setProjectBusy(false);
+    }
+  }
+  async function deleteSimulation() {
+    if (!selectedSimulation || !selectedProject) return;
+    if (!window.confirm(`¿Eliminar “${selectedSimulation.name}”? Se borrarán el paquete CHARMM-GUI, los archivos preparados y los resultados locales.`)) return;
+    setProjectBusy(true);
+    setProjectError('');
+    try {
+      const response = await fetch(
+        `${API_BASE}/projects/${projectId}/simulations/${selectedSimulation.id}`,
+        { method: 'DELETE' },
+      );
+      const body = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(body.error || 'No se pudo eliminar la simulación.');
+      const remaining = selectedProject.simulations.filter(
+        (item) => item.id !== selectedSimulation.id,
+      );
+      setProjects((items) =>
+        items.map((project) =>
+          project.id === projectId ? { ...project, simulations: remaining } : project,
+        ),
+      );
+      setData(null);
+      setSimulationId(remaining[0]?.id ?? '');
+      if (remaining[0]) await chooseSimulation(projectId, remaining[0].id);
+      setUploadMessage('Simulación eliminada.');
+      setUploadState('success');
+    } catch (error) {
+      setProjectError(error instanceof Error ? error.message : 'No se pudo eliminar la simulación.');
+    } finally {
+      setProjectBusy(false);
+    }
+  }
   async function runPreparation() {
     if (!selectedSimulation) {
       setUploadState('error');
@@ -1128,16 +1262,41 @@ export default function Home() {
       });
       const result = (await response.json()) as {
         jobId?: string;
+        pid?: number;
+        stepCountsAligned?: string[];
+        status?: string;
+        skippedStages?: string[];
+        pendingStages?: string[];
         error?: string;
         targetName?: string;
         remoteDir?: string;
       };
-      if (!response.ok || !result.jobId)
+      if (!response.ok)
+        throw new Error(result.error || 'No se pudo iniciar la preparación.');
+      if (result.status === 'already-completed') {
+        await loadProjects(projectId, simulationId);
+        setRunState('idle');
+        setUploadState('success');
+        setUploadMessage('Todas las etapas ya terminaron correctamente; no se repitió ninguna.');
+        setUploadLogs([
+          `[${logClock()}] Simulación ya completada.`,
+          ...(result.skippedStages ?? []).map((stage) => `[SKIP] ${stage} · terminada correctamente`),
+        ]);
+        return;
+      }
+      if (!result.jobId)
         throw new Error(result.error || 'No se pudo iniciar la preparación.');
       setCurrentJobId(result.jobId);
       setUploadLogs((lines) => [
         ...lines,
         `[${logClock()}] Destino: ${result.targetName}`,
+        ...(result.pid ? [`[PID] Proceso lanzador: ${result.pid}`] : []),
+        ...(result.stepCountsAligned?.length
+          ? [`[NAMD] Pasos recalibrados: ${result.stepCountsAligned.join(', ')}`]
+          : []),
+        ...(result.skippedStages ?? []).map(
+          (stage) => `[SKIP] ${stage} · terminada correctamente`,
+        ),
         ...(result.remoteDir
           ? [`[${logClock()}] Resultados remotos: ${result.remoteDir}`]
           : []),
@@ -1154,6 +1313,8 @@ export default function Home() {
             { cache: 'no-store' },
           ).then((r) => r.json())) as {
             status: string;
+            pid?: number;
+            slurmJobId?: string | null;
             syncError?: string;
             returncode: number | null;
             lines: string[];
@@ -1190,9 +1351,13 @@ export default function Home() {
                     !line.startsWith('[NAMD]') &&
                     !line.startsWith('[TAIL') &&
                     !line.startsWith('[FIN]') &&
-                    !line.startsWith('[SYNC]'),
+                    !line.startsWith('[SYNC]') &&
+                    !line.startsWith('[SLURM]'),
                 )
                 .slice(0, 6),
+              ...(status.slurmJobId
+                ? [`[SLURM] Job ID: ${status.slurmJobId}`]
+                : []),
               ...status.lines.map((line) => `[NAMD] ${line}`),
               ...completedLines,
               ...progress,
@@ -1558,6 +1723,20 @@ export default function Home() {
                   : 'Cargar CHARMM-GUI'}
               </button>
               <button
+                className="text-button"
+                onClick={() => void deleteSimulation()}
+                disabled={
+                  !selectedSimulation ||
+                  uploadState === 'uploading' ||
+                  projectBusy ||
+                  runState !== 'idle'
+                }
+                title="Eliminar la simulación seleccionada y sus archivos locales"
+              >
+                <Trash2 />
+                Eliminar simulación
+              </button>
+              <button
                 className={`run-button ${runState !== 'idle' ? 'stop' : ''}`}
                 onClick={() =>
                   void (runState === 'idle'
@@ -1622,8 +1801,8 @@ export default function Home() {
               </span>
             </div>
           </header>
-          {uploadState !== 'idle' && (
-            <div className="upload-module">
+          <div className="upload-module">
+            {uploadState !== 'idle' && (
               <div className={`upload-feedback ${uploadState}`}>
                 {uploadState === 'uploading' ? (
                   <LoaderCircle className="spin" />
@@ -1637,7 +1816,8 @@ export default function Home() {
                   <button onClick={() => setUploadState('idle')}>×</button>
                 )}
               </div>
-              <div className="upload-console">
+            )}
+              <div className={`upload-console ${uploadState === 'idle' ? 'standalone' : ''}`}>
                 <div className="console-head">
                   <span>
                     <i /> PIPELINE LOG
@@ -1666,7 +1846,6 @@ export default function Home() {
                 </div>
               </div>
             </div>
-          )}
           <article className="panel project-module">
             <div>
               <p className="eyebrow">PROYECTO → SIMULACIÓN</p>
@@ -1729,7 +1908,8 @@ export default function Home() {
                   </option>
                   {selectedProject?.simulations.map((simulation) => (
                     <option key={simulation.id} value={simulation.id}>
-                      {simulation.name} · {simulation.id.slice(0, 6)}
+                      {simulation.name} · {simulation.state?.progressPercent ?? 0}% ·{' '}
+                      {simulation.id.slice(0, 6)}
                     </option>
                   ))}
                 </select>
@@ -1745,6 +1925,23 @@ export default function Home() {
                   <small title={selectedProject.directory}>
                     Ubicación: {selectedProject.directory}
                   </small>
+                )}
+                {selectedSimulation?.state && (
+                  <div className="simulation-state" aria-live="polite">
+                    <strong>
+                      Paso actual:{' '}
+                      {selectedSimulation.state.currentStep ?? 'sin iniciar'}
+                    </strong>
+                    <span>
+                      {selectedSimulation.state.progressPercent}% ·{' '}
+                      {selectedSimulation.state.completedSteps.length} terminadas ·{' '}
+                      {selectedSimulation.state.pendingSteps.length} pendientes
+                    </span>
+                    <progress
+                      max={100}
+                      value={selectedSimulation.state.progressPercent}
+                    />
+                  </div>
                 )}
                 <button
                   className="text-button"
@@ -1820,6 +2017,15 @@ export default function Home() {
                 </button>
               )}
             </form>
+            <button
+              type="button"
+              className="text-button"
+              disabled={projectBusy || uploadState === 'uploading' || runState !== 'idle'}
+              onClick={() => void importProject()}
+            >
+              <Upload />
+              Cargar proyecto desde config.ini
+            </button>
             {projectError && (
               <p role="alert">
                 {projectError}{' '}
@@ -1851,7 +2057,10 @@ export default function Home() {
           </article>
           <ExecutionModule
             value={targetId}
-            onChange={setTargetId}
+            onChange={(id) => {
+              setTargetId(id);
+              window.localStorage.setItem(EXECUTION_TARGET_STORAGE_KEY, id);
+            }}
             disabled={runState !== 'idle' || uploadState === 'uploading'}
             onManage={() => setView('ssh')}
           />
@@ -1893,7 +2102,7 @@ export default function Home() {
                     <strong>
                       {lastRmsd != null ? lastRmsd.toFixed(3) : 'pendiente'}
                     </strong>
-                    <small>Å · desde .dcd/.coor.old alineado</small>
+                    <small>Å · desde snapshots .coor.old alineados</small>
                   </div>
                 </article>
                 <article className="kpi">

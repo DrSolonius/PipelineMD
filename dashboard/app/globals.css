@@ -855,6 +855,10 @@ nav {
   box-shadow: inset 0 1px #07111f;
   overflow: hidden;
 }
+.upload-console.standalone {
+  border-top: 1px solid #294560;
+  border-radius: 10px;
+}
 .console-head {
   height: 34px;
   display: flex;
@@ -1388,6 +1392,21 @@ nav {
 }
 .project-description p {
   overflow-wrap: anywhere;
+}
+
+.simulation-state {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  color: #c9d6e5;
+  font-size: 13px;
+}
+.simulation-state span {
+  color: #93a4bb;
+}
+.simulation-state progress {
+  width: min(100%, 420px);
+  accent-color: #45c4a5;
 }
 
 .ssh-password {
